@@ -1,0 +1,6 @@
+interface:
+  display_name: "mineru-autonomous-ocr"
+  short_description: "AI 启动脚本自动完成 PDF 转换与双页码映射，保留成功分块并精简进度汇报"
+  default_prompt: "使用 mineru-autonomous-ocr，把指定目录中的 PDF 转换为 Markdown，默认保留 PDF 和原书印刷页码。"
+policy:
+  allow_implicit_invocation: true
