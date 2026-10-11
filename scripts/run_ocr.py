@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
@@ -540,8 +541,72 @@ def cleanup(dest):
         if path.exists(): shutil.rmtree(path)
 
 
+def markdown_name(source):
+    return source.stem + '.md'
+
+
+def name_key(source):
+    return unicodedata.normalize('NFC',markdown_name(source)).casefold()
+
+
+def collection_target(source,out):
+    folder=safe_path(out,'Markdown')
+    target=safe_path(folder,markdown_name(source))
+    index_path=folder/'_index.json'
+    index=read_json(index_path) if index_path.exists() else {}
+    entry=index.get(name_key(source))
+    if entry and entry.get('source')!=str(source.resolve()):
+        raise NeedsDecision('不同来源 PDF 同名：'+source.name+'；请先重命名输入 PDF，不能覆盖已有 Markdown')
+    existing=[p for p in folder.glob('*.md') if unicodedata.normalize('NFC',p.name).casefold()==name_key(source)] if folder.exists() else []
+    for path in existing:
+        if not entry or path.name!=markdown_name(source):
+            raise NeedsDecision('集中目录存在同名 Markdown，无法确认归属：'+path.name)
+        accepted={entry.get('markdown_sha256')}
+        if entry.get('publishing'): accepted.add(entry.get('previous_markdown_sha256'))
+        if entry.get('markdown_sha256') and sha256(path) not in accepted:
+            raise NeedsDecision('集中 Markdown 已被修改；请先保留或移走该文件：'+path.name)
+    return folder,target,index_path,index
+
+
+def collect_markdown(source,out,dest):
+    folder,target,index_path,index=collection_target(source,out)
+    folder.mkdir(parents=True,exist_ok=True)
+    sid=dest.name
+    image_prefix='images/'+sid+'/'
+    md=(dest/'document.md').read_text(encoding='utf-8')
+    md=re.sub(r'(!\[[^\]]*\]\()([^\s)]+)(\))',
+              lambda m:m[1]+image_prefix+m[2]+m[3],md)
+    assets={}
+    for image in (dest/'images').rglob('*') if (dest/'images').exists() else []:
+        if image.is_file():
+            rel=image_prefix+image.relative_to(dest).as_posix()
+            copy=safe_path(folder,rel)
+            copy.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copyfile(image,copy)
+            assets[rel]=sha256(copy)
+    for rel in re.findall(r'!\[[^\]]*\]\(([^\s)]+)\)',md):
+        if not safe_path(folder,rel).is_file():
+            raise NeedsDecision('集中 Markdown 的图片引用缺失')
+    entry={'source':str(source.resolve()),'source_sha256':sha256(source),
+           'markdown':target.name,'markdown_sha256':hashlib.sha256(md.encode('utf-8')).hexdigest(),
+           'assets':assets,'publishing':True,
+           'previous_markdown_sha256':index.get(name_key(source),{}).get('markdown_sha256')}
+    # Record ownership before atomic publication, so interrupted first exports can resume.
+    index[name_key(source)]=entry
+    save_json(index_path,index)
+    tmp=target.with_name(target.name+'.tmp')
+    tmp.write_text(md,encoding='utf-8'); tmp.replace(target)
+    if sha256(target)!=entry['markdown_sha256'] or (assets and not validate_hashes(folder,assets)):
+        raise NeedsDecision('集中输出校验失败')
+    entry.pop('publishing'); entry.pop('previous_markdown_sha256')
+    save_json(index_path,index)
+    LOG.info('集中整理 %s -> %s',source,target)
+    return str(target)
+
+
 def process_pdf(source,out,session,args):
     check_pause(args)
+    collection_target(source,out)  # Detect filename conflicts before any upload.
     digest=sha256(source)
     loc=hashlib.sha256(str(source).encode()).hexdigest()[:8]
     sid=re.sub(r'[^\w.-]+','_',source.stem)[:60]+'__'+digest[:12]+'_'+loc
@@ -562,8 +627,10 @@ def process_pdf(source,out,session,args):
     if final.exists():
         manifest=read_json(final)
         if manifest.get('status')=='complete' and validate_hashes(dest,manifest.get('hashes')):
+            markdown=collect_markdown(source,out,dest)
             cleanup(dest)
             return {'source':str(source),'status':'complete','reused':True,'output':str(dest),
+                    'markdown':markdown,
                     **manifest['counts']}
         LOG.warning('最终产物缺失/损坏；核查成功分块并重建')
         final.unlink()  # Never leave a stale completion marker after a validation failure.
@@ -586,8 +653,10 @@ def process_pdf(source,out,session,args):
               'chunks':state['chunks'],'verification':'automatic; printed labels not manually verified'}
     save_json(final,manifest)
     state['status']='complete'; save_json(state_path,state)
+    markdown=collect_markdown(source,out,dest)
     cleanup(dest)
-    return {'source':str(source),'status':'complete','reused':False,'output':str(dest),**counts}
+    return {'source':str(source),'status':'complete','reused':False,'output':str(dest),
+            'markdown':markdown,**counts}
 
 
 @contextmanager
@@ -642,6 +711,7 @@ def compact_report(report):
             'printed_unknown':sum(x.get('printed_unknown',0) for x in results),
             'no_content_pages':sum(x.get('no_content_pages',0) for x in results),
             'failure_summary':failures[:3],'current':report.get('current'),
+            'markdown_dir':report.get('markdown_dir'),
             'log':report.get('log'),'report':report.get('report')}
 
 
@@ -656,6 +726,13 @@ def main(argv=None):
                       [p.expanduser().resolve() for p in args.exclude])
     if not sources:
         print(json.dumps({'event':'failure','reason':'没有 PDF 输入'},ensure_ascii=False)); return 1
+    names={}
+    for source in sources:
+        key=name_key(source)
+        if key in names:
+            print(json.dumps({'event':'failure','reason':'不同来源 PDF 同名；请先重命名输入，集中输出不能覆盖',
+                              'sources':[str(names[key]),str(source)]},ensure_ascii=False)); return 1
+        names[key]=source
     if args.dry_run:
         result=[]
         for source in sources:
@@ -675,6 +752,7 @@ def main(argv=None):
     # Third-party warnings go to the same log, not the AI's context.
     logging.captureWarnings(True)
     report={'status':'running','expected':len(sources),'results':[],'log':str(log_path),
+            'markdown_dir':str(args.output/'Markdown'),
             'report':str(args.output/'_report.json')}
     try:
         with output_lock(args.output),requests.Session() as session:
