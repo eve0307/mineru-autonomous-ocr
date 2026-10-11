@@ -137,11 +137,53 @@ class WorkflowTests(unittest.TestCase):
         s=Session(payload=result_zip(kind='new_unsupported'))
         with self.assertRaises(ocr.NeedsDecision): self.run_pdf(s)
         self.assertFalse(any(self.out.rglob('manifest.json')))
-    def test_same_name_separate_destinations(self):
+    def test_same_name_is_rejected_before_second_upload(self):
         pdf(self.source,1); other=self.root/'another'; other.mkdir(); other=other/'book.pdf'
         other.write_bytes(self.source.read_bytes()); s=Session()
-        a=self.run_pdf(s)['output']; b=ocr.process_pdf(other,self.out,s,self.args)['output']
-        self.assertNotEqual(a,b)
+        self.run_pdf(s)
+        with self.assertRaises(ocr.NeedsDecision): ocr.process_pdf(other,self.out,s,self.args)
+        self.assertEqual(len(s.posts),1)
+
+    def test_collected_name_and_images(self):
+        self.source=self.root/'中文书名 (修订).PDF'; s=Session()
+        r=self.run_pdf(s,3)
+        md=Path(r['markdown'])
+        self.assertEqual(md,self.out/'Markdown'/'中文书名 (修订).md')
+        for rel in ocr.re.findall(r'!\[[^\]]*\]\(([^\s)]+)\)',md.read_text()):
+            self.assertTrue((md.parent/rel).is_file())
+
+    def test_all_final_markdown_in_one_folder(self):
+        s=Session(); first=self.run_pdf(s)
+        second=self.root/'other.pdf'; pdf(second,1)
+        other=ocr.process_pdf(second,self.out,s,self.args)
+        self.assertEqual(Path(first['markdown']).parent,Path(other['markdown']).parent)
+        self.assertEqual({p.name for p in (self.out/'Markdown').glob('*.md')},{'book.md','other.md'})
+
+    def test_deleted_collection_is_rebuilt_without_upload(self):
+        s=Session(); r=self.run_pdf(s)
+        ocr.shutil.rmtree(self.out/'Markdown')
+        new=self.run_pdf(s)
+        self.assertTrue(Path(new['markdown']).exists()); self.assertEqual(len(s.posts),1)
+
+    def test_collected_image_is_repaired_without_upload(self):
+        s=Session(); r=self.run_pdf(s)
+        md=Path(r['markdown'])
+        rel=ocr.re.findall(r'!\[[^\]]*\]\(([^\s)]+)\)',md.read_text())[0]
+        (md.parent/rel).unlink(); self.run_pdf(s)
+        self.assertTrue((md.parent/rel).is_file()); self.assertEqual(len(s.posts),1)
+
+    def test_user_edited_collection_is_not_overwritten(self):
+        s=Session(); r=self.run_pdf(s); md=Path(r['markdown'])
+        md.write_text('User changes')
+        with self.assertRaises(ocr.NeedsDecision): self.run_pdf(s)
+        self.assertEqual(md.read_text(),'User changes'); self.assertEqual(len(s.posts),1)
+
+    def test_batch_same_names_fail_before_processing(self):
+        pdf(self.source,1); sub=self.root/'sub'; sub.mkdir(); pdf(sub/'BOOK.pdf',1)
+        s=Session()
+        with patch.object(ocr.requests,'Session',return_value=s),redirect_stdout(io.StringIO()):
+            code=ocr.main(['--input',str(self.root),'--output',str(self.out),'--dry-run'])
+        self.assertEqual(code,1); self.assertFalse(s.posts)
     def test_pause_stops_before_upload(self):
         self.args.pause_file.touch(); s=Session()
         with self.assertRaises(ocr.Paused): self.run_pdf(s)
