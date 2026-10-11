@@ -60,13 +60,15 @@ AI 应启动并跟进进程。使用者保持电脑联网、避免休眠，并�
 
 ## 输出
 
-每个原 PDF 对应独立文件夹，包含 `document.md`、`page_map.json`、`page_blocks.jsonl`、图片、原始 Markdown 和结构数据。输出根目录保存 `_run.log`、`_status.json` 与 `_report.json`。
+所有最终 Markdown 默认集中在输出目录的 `Markdown/` 文件夹，名称与原 PDF 一致：`书名.pdf` → `Markdown/书名.md`。配套图片放在 `Markdown/images/`，相对链接一并整理。不同来源同名 PDF 会在上传前提示重命名，避免覆盖。
+
+每个来源另保留独立恢复目录，包含内部缓存 `document.md`、`page_map.json`、`page_blocks.jsonl`、图片、原始 Markdown 和结构数据。集中目录或图片删除后，续跑可从缓存重新整理，无需重新上传。人工修改过的集中 Markdown 会提示保留或移走，不直接覆盖。输出根目录保存 `_run.log`、`_status.json` 与 `_report.json`。
 
 具体参数、断点续跑、人工页码映射与异常处理见 [执行参考](references/workflow.md)。
 
 ## 当前验证与限制
 
-[26项离线测试通过](validation.md)，覆盖切块、模拟 API、失败续跑、完整性检查和页码识别。尚未进行真实 MinerU 账户在线联调。
+[32项离线测试通过](validation.md)，覆盖切块、模拟 API、失败续跑、完整性检查和页码识别。尚未进行真实 MinerU 账户在线联调。
 
 默认页码识别面向页眉/页脚的阿拉伯和罗马数字；复杂版式、竖排双页和中文数字可能仍需人工映射。自动识别不是人工核实，正式引文应回查原 PDF。只支持已适配的 V1 页级内容列表；不兼容结果会停止该文件并报告。
 
