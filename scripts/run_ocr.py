@@ -279,7 +279,8 @@ def process_chunk(session, part, index, state, state_path, dest, args):
         name = f"source_{state['sha256'][:16]}_p{a+1}-{b}.pdf"
         rec.update(status='allocating',name=name,attempts=rec.get('attempts',0)+1)
         save_json(state_path,state)  # Persist uncertainty before any mutating request.
-        payload={'files':[{'name':name,'data_id':name[:-4],'is_ocr':True}],
+        # 电子版 PDF 有文字层时，强制 OCR 反而可能整页漏字；--no-force-ocr 让 MinerU 走文字层。
+        payload={'files':[{'name':name,'data_id':name[:-4],'is_ocr':not args.no_force_ocr}],
                  'model_version':args.model,'language':args.language,
                  'enable_formula':True,'enable_table':True}
         try:
@@ -447,13 +448,25 @@ def field_text(value):
     raise NeedsDecision('内容字段格式不兼容；保留原始结构供判断')
 
 
+EMPTY_BLOCK='\x00empty_block'  # 幽灵空块哨兵：不渲染，但计入页面级审计
+
+def blank_value(value):
+    # ["", ""] 这类"列表非空但元素全空"的字段必须算空：MinerU 会产出这种表/图占位块。
+    if value is None: return True
+    if isinstance(value,str): return not value.strip()
+    if isinstance(value,(list,tuple)): return all(blank_value(v) for v in value)
+    return not value
+
 def block_md(block,prefix,cache):
     kind=block.get('type')
     if kind in ('page_number','header','footer','discarded'): return ''
-    if kind not in ('text','title','list','table','image','equation','code'):
+    # MinerU V1 内容型块一律渲染，避免静默丢正文（脚注/参考文献/页边文字/图表）。全语料类型普查确认无其它未知类型。
+    if kind not in ('text','title','list','table','image','equation','code','chart',
+                    'page_footnote','ref_text','aside_text',
+                    'image_caption','image_footnote','table_caption','table_footnote'):
         raise NeedsDecision('不支持的内容类型：'+safe_message(kind))
     bits=[]
-    body=field_text(block.get('text') or block.get('table_body') or block.get('content') or block.get('list_items'))
+    body=field_text(block.get('text') or block.get('table_body') or block.get('code_body') or block.get('content') or block.get('list_items'))
     def image_ref(path):
         local=safe_path(cache,path)
         if not local.is_file(): raise NeedsDecision('图片引用缺失')
@@ -468,10 +481,23 @@ def block_md(block,prefix,cache):
         bits.append(body.strip())
     if block.get('img_path'):
         bits.append(f"![{kind}]({image_ref(block['img_path'])})")
-    for name in ('image_caption','image_footnote','table_caption','table_footnote'):
+    for name in ('image_caption','image_footnote','table_caption','table_footnote',
+                 'chart_caption','chart_footnote'):
         value=field_text(block.get(name))
         if value.strip(): bits.append(value.strip())
-    if not bits: raise NeedsDecision('内容块无法转换，禁止静默遗漏')
+    if not bits:
+        fields=('text','table_body','code_body','content','list_items','img_path',
+                'image_caption','image_footnote','table_caption','table_footnote',
+                'chart_caption','chart_footnote')
+        # 只有"已知内容字段"和"任何未知字段"都为空，才算空占位块。
+        # 未知字段里有内容 => 字段名未适配，必须中止交人工，不能静默丢。
+        unknown=[k for k,v in block.items()
+                 if k not in fields and k not in ('type','bbox','page_idx','text_level')
+                 and not blank_value(v)]
+        if all(blank_value(block.get(k)) for k in fields) and not unknown:
+            LOG.warning('空内容块已跳过 type=%s page_idx=%s bbox=%s',kind,block.get('page_idx'),block.get('bbox'))
+            return EMPTY_BLOCK
+        raise NeedsDecision('内容块无法转换，禁止静默遗漏')
     return '\n\n'.join(bits)
 
 
@@ -490,6 +516,7 @@ def build_document(dest,spans,caches,page_map,state,args):
         check_pause(args)
         rows=read_json(cache/'content_list.json')
         content={n:[] for n in range(a+1,b+1)}
+        empty={n:0 for n in range(a+1,b+1)}
         last=-1
         prefix=f'images/chunk_{index:04d}'
         for row in rows:
@@ -502,6 +529,7 @@ def build_document(dest,spans,caches,page_map,state,args):
             n=a+local+1
             all_blocks.append({**row,'pdf_page':n,'source_chunk':index})
             rendered=block_md(row,prefix,cache)
+            if rendered==EMPTY_BLOCK: empty[n]+=1; rendered=''
             if rendered: content[n].append(rendered)
         for image in (cache/'images').rglob('*') if (cache/'images').exists() else []:
             if image.is_file():
@@ -511,6 +539,7 @@ def build_document(dest,spans,caches,page_map,state,args):
         for n in range(a+1,b+1):
             page_map[n-1]['has_ocr_blocks']=bool(content[n])
             page_map[n-1]['content_status']='extracted' if content[n] else 'no_blocks_needs_review'
+            if empty[n]: page_map[n-1]['empty_blocks_skipped']=empty[n]
             parts.append(marker(page_map[n-1])+'\n\n'+'\n\n'.join(content[n]))
     md='\n\n'.join(parts).rstrip()+'\n'
     if [int(n) for n in re.findall(r'\*\*【PDF 第 (\d+) 页',md)]!=list(range(1,len(page_map)+1)):
@@ -615,7 +644,11 @@ def process_pdf(source,out,session,args):
     state_path=dest/'_state.json'
     state=read_json(state_path) if state_path.exists() else {'sha256':digest,'source':str(source)}
     reader=PdfReader(source,strict=False)
-    if reader.is_encrypted: raise NeedsDecision('加密 PDF 需要先提供可读取副本')
+    if reader.is_encrypted:
+        # pypdf 对"只设权限位/所有者口令"的 PDF 也标 is_encrypted；空口令能打开就继续。
+        try: unlocked=bool(reader.decrypt(''))
+        except Exception: unlocked=False
+        if not unlocked: raise NeedsDecision('加密 PDF 空口令无法打开；需要先提供可读取副本')
     total=len(reader.pages)
     csv_path=source.with_suffix(source.suffix+'.pages.csv')
     config={'model':args.model,'language':args.language,'no_printed_pages':args.no_printed_pages,
@@ -684,6 +717,7 @@ def parse_args(argv=None):
     p.add_argument('--no-recursive',action='store_true')
     p.add_argument('--exclude',type=Path,action='append',default=[])
     p.add_argument('--no-printed-pages',action='store_true',help='only when the user confirms no printed page numbers')
+    p.add_argument('--no-force-ocr',action='store_true',help='使用 PDF 文字层而非强制 OCR（仅适用于有文字层的电子版 PDF）')
     p.add_argument('--retry-failed',action='store_true')
     p.add_argument('--max-submissions',type=int,default=2)
     p.add_argument('--network-retries',type=int,default=2)

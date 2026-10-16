@@ -292,4 +292,77 @@ class WorkflowTests(unittest.TestCase):
         report=json.loads((self.out/'_report.json').read_text())
         self.assertEqual(len(report['results']),1); self.assertEqual(len(report['unprocessed']),1)
 
+    # ---- 回归测试：真实语料中暴露的 6 类问题（见 README/交付说明）----
+
+    def custom_zip(self,rows,extra=None):
+        buf=io.BytesIO()
+        with zipfile.ZipFile(buf,'w') as z:
+            z.writestr('bundle/full.md','Original Markdown')
+            z.writestr('bundle/test_content_list.json',json.dumps(rows))
+            for name,data in (extra or {}).items(): z.writestr('bundle/'+name,data)
+        return buf.getvalue()
+
+    def test_permission_flagged_pdf_is_accepted(self):
+        """仅设所有者口令/权限位的 PDF：pypdf 会标 is_encrypted，但空口令能打开，必须放行。"""
+        with fitz.open() as doc:
+            doc.new_page(width=300,height=400).insert_text((30,100),'Example body',fontsize=12)
+            doc.save(self.source,encryption=fitz.PDF_ENCRYPT_AES_256,owner_pw='owner-secret',user_pw='')
+        self.assertTrue(ocr.PdfReader(self.source,strict=False).is_encrypted)
+        self.assertEqual(self.run_pdf(Session())['status'],'complete')
+
+    def test_truly_encrypted_pdf_still_stops(self):
+        """确实需要口令的 PDF 仍须交人工判断，不能因为放宽加密判定而放行。"""
+        with fitz.open() as doc:
+            doc.new_page(width=300,height=400).insert_text((30,100),'secret',fontsize=12)
+            doc.save(self.source,encryption=fitz.PDF_ENCRYPT_AES_256,owner_pw='o',user_pw='realpassword')
+        with self.assertRaises(ocr.NeedsDecision): self.run_pdf(Session())
+
+    def test_footnote_and_reference_blocks_are_rendered(self):
+        """脚注/参考文献/页边文字都是正文型内容，必须渲染，不能因此中止整本。"""
+        rows=[{'type':'text','text':'正文一','page_idx':0},
+              {'type':'page_footnote','text':'脚注一','page_idx':0},
+              {'type':'ref_text','text':'参考文献一','page_idx':0},
+              {'type':'aside_text','text':'页边一','page_idx':0}]
+        r=self.run_pdf(Session(payload=self.custom_zip(rows)))
+        self.assertEqual(r['status'],'complete')
+        md=(Path(r['output'])/'document.md').read_text()
+        for text in ('正文一','脚注一','参考文献一','页边一'): self.assertIn(text,md)
+
+    def test_chart_image_and_caption_are_kept(self):
+        """chart 块要渲染图片，且图表题注不能被静默丢弃。"""
+        rows=[{'type':'chart','content':'','img_path':'images/c.png',
+               'chart_caption':['图一 说明'],'chart_footnote':[],'page_idx':0}]
+        r=self.run_pdf(Session(payload=self.custom_zip(rows,{'images/c.png':b'png-bytes'})))
+        self.assertEqual(r['status'],'complete')
+        md=(Path(r['output'])/'document.md').read_text()
+        self.assertIn('图一 说明',md); self.assertIn('images/c.png',md)
+
+    def test_blank_blocks_are_skipped_with_audit(self):
+        """全字段为空的占位块跳过并留审计；[""] 这类"列表非空但元素全空"也算空。"""
+        rows=[{'type':'text','text':'','page_idx':0},
+              {'type':'table','table_body':'','table_caption':[''],'table_footnote':[''],'page_idx':1},
+              {'type':'text','text':'有内容','page_idx':2}]
+        r=self.run_pdf(Session(payload=self.custom_zip(rows)),3)
+        self.assertEqual(r['status'],'complete'); self.assertEqual(r['no_content_pages'],2)
+        pages=json.loads((Path(r['output'])/'page_map.json').read_text())['pages']
+        self.assertEqual(sum(p.get('empty_blocks_skipped',0) for p in pages),2)
+        self.assertIn('有内容',(Path(r['output'])/'document.md').read_text())
+
+    def test_nonblank_unknown_field_still_stops(self):
+        """内容藏在未适配字段里时不允许静默丢弃，必须中止交人工。"""
+        rows=[{'type':'table','unknown_body':'有内容但字段名未适配','page_idx':0}]
+        with self.assertRaises(ocr.NeedsDecision): self.run_pdf(Session(payload=self.custom_zip(rows)))
+        self.assertFalse(any(self.out.rglob('manifest.json')))
+
+    def test_no_force_ocr_flag_is_sent_to_api(self):
+        """--no-force-ocr 时 is_ocr 必须为 False；默认仍为 True（强制 OCR）。"""
+        s=Session(); self.run_pdf(s)
+        self.assertTrue(s.posts[0]['files'][0]['is_ocr'])
+        out2=self.root/'out2'; out2.mkdir()
+        args=ocr.parse_args(['--input',str(self.source),'--output',str(out2),
+                             '--pause-file',str(self.root/'pause'),'--network-retries','0',
+                             '--poll-seconds','.001','--no-force-ocr'])
+        s2=Session(); ocr.process_pdf(self.source,out2,s2,args)
+        self.assertFalse(s2.posts[0]['files'][0]['is_ocr'])
+
 if __name__=='__main__': unittest.main()
